@@ -53,7 +53,7 @@ AbdullahSP1-MT5/
 ├── README.md                # System documentation
 ├── full_context.txt         # Consolidated single-file codebase dump
 ├── mt5/
-│   └── AbdullahSP1_Client.mq5 # MQL5 Custom Indicator Client for MT5
+│   └── AbdullahSP1_Client.mq5 # MQL5 Expert Advisor Client for MT5
 └── server/
     ├── package.json         # Node.js dependencies & scripts
     ├── server.js             # REST API Express Server
@@ -137,12 +137,19 @@ npm test
 5. Add `http://127.0.0.1:3000` (or your remote server IP/domain).
 6. Click **OK**.
 
-#### Step B: Install Indicator
+#### Step B: Install Expert Advisor
+
+> ⚠️ **`AbdullahSP1_Client.mq5` is an Expert Advisor (EA), not a passive indicator.**
+> It must be placed in `MQL5/Experts/` and attached with **Algo Trading enabled**.
+> Placing it in `MQL5/Indicators/` will cause a compile error.
+
 1. Open MT5 and select **File -> Open Data Folder**.
-2. Navigate to `MQL5/Indicators/`.
+2. Navigate to `MQL5/Experts/`.
 3. Copy `mt5/AbdullahSP1_Client.mq5` into this folder.
-4. Restart MT5 or right-click **Indicators** in the Navigator panel and select **Refresh**.
-5. Drag `AbdullahSP1_Client` onto any chart (e.g. EURUSD, H4).
+4. In the MT5 toolbar, click the **MetaEditor** button (or press `F4`), open the file, and press `F7` to compile. Confirm there are no errors in the Errors tab.
+5. Back in MT5, right-click **Expert Advisors** in the Navigator panel and select **Refresh**.
+6. Make sure the **Algo Trading** button in the MT5 toolbar is **enabled** (green).
+7. Drag `AbdullahSP1_Client` from the Navigator onto any chart (e.g. EURUSD, H4) and click **OK**.
 
 ---
 
