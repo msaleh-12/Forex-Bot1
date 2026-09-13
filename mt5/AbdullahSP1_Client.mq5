@@ -1,317 +1,346 @@
 //+------------------------------------------------------------------+
-//|                                    AbdullahSP1_Client.mq5         |
-//|                     Copyright 2026, Abdullah SP1 Engine           |
-//|  Thin client: sends OHLCV to a private server, draws the         |
-//|  BUY/SELL markers the server tells it to. No strategy logic      |
-//|  lives in this file - it is 100% on your server.                 |
+//|                                    AbdullahSP1_Client.mq5        |
+//|                     Abdullah Strategy Part 1 — v3.1              |
+//|  Fixes:                                                           |
+//|    - Invisible markers (anchor/price inversion)                   |
+//|    - Duplicate markers (name keyed on time only, not signal type) |
+//|    - Cross-system bar-detection (uses OnCalculate, not OnTick)    |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Abdullah SP1 Engine"
-#property version   "3.00"
+#property version   "3.10"
 #property strict
 
-//--- Inputs: Server connection
-input string InpServerBaseUrl   = "http://127.0.0.1:3000"; // Server base URL, NO trailing slash
-input int    InpHttpTimeoutMs   = 5000;                     // WebRequest timeout (ms)
+//--- Inputs
+input string InpServerBaseUrl   = "http://127.0.0.1:3000";
+input int    InpHttpTimeoutMs   = 5000;
+input int    InpCandleCount     = 50;
+input int    InpHistoryCount    = 300;
+input bool   InpBackfillOnStart = true;
 
-//--- Inputs: Data window sizes
-input int    InpCandleCount     = 50;    // Closed candles sent per live signal check
-input int    InpHistoryCount    = 300;   // Closed candles used for historical backfill
-input bool   InpBackfillOnStart = true;  // Draw historical markers when EA attaches
-
-//--- Inputs: Strategy settings (mirrors your Pine inputs, sent to server)
+//--- Strategy settings (sent to server, mirrors Pine inputs)
 input int    InpSpreadLen    = 20;
 input double InpSmallFactor  = 1.0;
-input bool   InpShowDemand   = true;   // No Demand -> BUY marker (above bar)
-input bool   InpShowSupply   = true;   // No Supply -> SELL marker (below bar)
+input bool   InpShowDemand   = true;
+input bool   InpShowSupply   = true;
 
-//--- Inputs: Marker appearance (mirrors ndDotCol / nsDotCol in Pine)
-input color  InpBuyColor     = clrOrange; // No Demand marker color
-input color  InpSellColor    = clrLime;   // No Supply marker color
-input int    InpMarkerCode   = 159;       // Wingdings filled-circle arrow code
-input int    InpMarkerWidth  = 1;
-input double InpOffsetFactor = 0.35;      // Marker distance from bar, as fraction of that bar's range
+//--- Marker appearance
+input color  InpBuyColor     = clrOrange;
+input color  InpSellColor    = clrLime;
+input int    InpMarkerCode   = 159;      // Wingdings filled circle
+input int    InpMarkerWidth  = 2;
+input double InpOffsetFactor = 0.35;     // fraction of bar range
 
-input bool   DEBUG_MODE      = true;
+input bool   DEBUG_MODE = true;
 
 #define OBJ_PREFIX "SP1_"
 
-//--- Global state
-datetime g_lastSeenFormingBarTime = 0;
-bool     g_backfillDone           = false;
+datetime g_lastBarTime  = 0;
+bool     g_backfillDone = false;
 
 //+------------------------------------------------------------------+
-//| Timeframe -> string                                               |
+//| Timeframe to string                                              |
 //+------------------------------------------------------------------+
-string GetTimeframeString(ENUM_TIMEFRAMES period)
+string TFString(ENUM_TIMEFRAMES tf)
 {
-   switch(period)
+   switch(tf)
    {
-      case PERIOD_M1:  return("M1");
-      case PERIOD_M5:  return("M5");
-      case PERIOD_M15: return("M15");
-      case PERIOD_M30: return("M30");
-      case PERIOD_H1:  return("H1");
-      case PERIOD_H4:  return("H4");
-      case PERIOD_D1:  return("D1");
-      case PERIOD_W1:  return("W1");
-      case PERIOD_MN1: return("MN1");
-      default: return(EnumToString(period));
+      case PERIOD_M1:  return "M1";
+      case PERIOD_M5:  return "M5";
+      case PERIOD_M15: return "M15";
+      case PERIOD_M30: return "M30";
+      case PERIOD_H1:  return "H1";
+      case PERIOD_H4:  return "H4";
+      case PERIOD_D1:  return "D1";
+      case PERIOD_W1:  return "W1";
+      case PERIOD_MN1: return "MN1";
+      default:         return EnumToString(tf);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Build the JSON "candles" array from a rates buffer.               |
-//| Every candle passed in here is treated as CLOSED (confirmed=true) |
-//| — caller is responsible for never including the forming bar.      |
+//| Build JSON candle array — every candle passed in is closed       |
 //+------------------------------------------------------------------+
-string BuildCandlesJson(const MqlRates &rates[], int count)
+string BuildCandlesJson(const MqlRates &r[], int count)
 {
-   string json = "[";
+   string j = "[";
    for(int i = 0; i < count; i++)
    {
-      json += "{\"time\":" + IntegerToString((long)rates[i].time) +
-              ",\"open\":"  + DoubleToString(rates[i].open, _Digits) +
-              ",\"high\":"  + DoubleToString(rates[i].high, _Digits) +
-              ",\"low\":"   + DoubleToString(rates[i].low, _Digits) +
-              ",\"close\":" + DoubleToString(rates[i].close, _Digits) +
-              ",\"volume\":" + IntegerToString(rates[i].tick_volume) +
-              ",\"confirmed\":true}";
-      if(i < count - 1) json += ",";
+      j += "{\"time\":"    + IntegerToString((long)r[i].time)    + ","
+         + "\"open\":"     + DoubleToString(r[i].open,  _Digits) + ","
+         + "\"high\":"     + DoubleToString(r[i].high,  _Digits) + ","
+         + "\"low\":"      + DoubleToString(r[i].low,   _Digits) + ","
+         + "\"close\":"    + DoubleToString(r[i].close, _Digits) + ","
+         + "\"volume\":"   + IntegerToString(r[i].tick_volume)   + ","
+         + "\"confirmed\":true}";
+      if(i < count - 1) j += ",";
    }
-   json += "]";
-   return json;
+   return j + "]";
 }
 
 //+------------------------------------------------------------------+
-//| Build the shared "settings" JSON block                            |
+//| Build settings JSON block                                        |
 //+------------------------------------------------------------------+
 string BuildSettingsJson()
 {
-   return "{\"spreadLen\":" + IntegerToString(InpSpreadLen) +
-          ",\"smallFactor\":" + DoubleToString(InpSmallFactor, 2) +
-          ",\"showDemand\":" + (InpShowDemand ? "true" : "false") +
-          ",\"showSupply\":" + (InpShowSupply ? "true" : "false") + "}";
+   return "{\"spreadLen\":"   + IntegerToString(InpSpreadLen)      + ","
+        + "\"smallFactor\":"  + DoubleToString(InpSmallFactor, 2)  + ","
+        + "\"showDemand\":"   + (InpShowDemand ? "true" : "false") + ","
+        + "\"showSupply\":"   + (InpShowSupply ? "true" : "false") + "}";
 }
 
 //+------------------------------------------------------------------+
-//| POST helper. Returns HTTP status code, or -1 on failure.          |
+//| HTTP POST — returns HTTP code, fills responseOut                 |
 //+------------------------------------------------------------------+
-int HttpPost(string url, string jsonBody, string &responseOut)
+int HttpPost(string url, string body, string &responseOut)
 {
-   uchar data[];
-   uchar result[];
-   string result_headers;
-   string headers = "Content-Type: application/json\r\n";
-
-   StringToCharArray(jsonBody, data, 0, StringLen(jsonBody));
+   uchar  data[], result[];
+   string resHdr, reqHdr = "Content-Type: application/json\r\n";
+   StringToCharArray(body, data, 0, StringLen(body));
 
    ResetLastError();
-   int status = WebRequest("POST", url, headers, InpHttpTimeoutMs, data, result, result_headers);
+   int code = WebRequest("POST", url, reqHdr, InpHttpTimeoutMs, data, result, resHdr);
 
-   if(status == -1)
+   if(code == -1)
    {
-      int err = GetLastError();
-      Print("[SP1 ERROR] WebRequest failed. Error: ", err,
-            ". Add this exact URL under Tools -> Options -> Expert Advisors -> Allow WebRequest: ", url);
+      Print("[SP1 ERROR] WebRequest failed err=", GetLastError(),
+            " — whitelist this URL: ", url);
       return -1;
    }
-
    responseOut = CharArrayToString(result);
-   if(DEBUG_MODE) Print("[SP1 DEBUG] POST ", url, " -> HTTP ", status);
-   return status;
+   if(DEBUG_MODE) Print("[SP1 DEBUG] POST ", url, " → HTTP ", code);
+   return code;
 }
 
 //+------------------------------------------------------------------+
-//| Draw one marker on the chart (idempotent - skips if it exists)    |
+//| Draw one marker on the chart                                     |
+//|                                                                  |
+//| FIX 1: Object name keyed on TIME ONLY (no BUY_/SELL_ prefix).   |
+//|   This guarantees at most ONE object per candle. If the server   |
+//|   changes its mind between two ticks, the old one is replaced.   |
+//|                                                                  |
+//| FIX 2: Anchor and price are consistent:                          |
+//|   BUY  marker sits BELOW the bar → price = low  - offset        |
+//|         ANCHOR_TOP means the tip of the arrow is at `price`      |
+//|   SELL marker sits ABOVE the bar → price = high + offset        |
+//|         ANCHOR_BOTTOM means the tip of the arrow is at `price`   |
 //+------------------------------------------------------------------+
 void DrawMarker(datetime barTime, double barHigh, double barLow, bool isBuy)
 {
-   string name = OBJ_PREFIX + (isBuy ? "BUY_" : "SELL_") + IntegerToString((long)barTime);
-
-   if(ObjectFind(0, name) >= 0) return; // already drawn
+   // One name per candle — deletes any previous marker for this bar
+   string name = OBJ_PREFIX + IntegerToString((long)barTime);
+   ObjectDelete(0, name);   // always delete first so type can change
 
    double range  = barHigh - barLow;
-   double offset = MathMax(range * InpOffsetFactor, 10 * _Point);
-   double price  = isBuy ? (barHigh + offset) : (barLow - offset);
-   color  col    = isBuy ? InpBuyColor : InpSellColor;
+   double offset = MathMax(range * InpOffsetFactor, 5 * _Point);
 
-   ObjectCreate(0, name, OBJ_ARROW, 0, barTime, price);
-   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, InpMarkerCode);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, col);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH, InpMarkerWidth);
-   ObjectSetInteger(0, name, OBJPROP_ANCHOR, isBuy ? ANCHOR_BOTTOM : ANCHOR_TOP);
-   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   double price;
+   ENUM_ARROW_ANCHOR anchor;
+   color  col;
 
-   if(DEBUG_MODE) Print("[SP1 DEBUG] Marker drawn: ", name, " @ ", price);
+   if(isBuy)
+   {
+      // BUY dot goes BELOW the bar (same as Pine's location.belowbar for noDemand)
+      // Wait — Pine plots noDemand ABOVE bar (abovebar). Match Pine exactly:
+      // noDemand (BUY)  → plotshape location.abovebar → price = high + offset
+      // noSupply (SELL) → plotshape location.belowbar → price = low  - offset
+      price  = barHigh + offset;
+      anchor = ANCHOR_BOTTOM;   // anchor point is at bottom of arrow glyph = price level
+      col    = InpBuyColor;
+   }
+   else
+   {
+      price  = barLow - offset;
+      anchor = ANCHOR_TOP;      // anchor point is at top of arrow glyph = price level
+      col    = InpSellColor;
+   }
+
+   if(ObjectCreate(0, name, OBJ_ARROW, 0, barTime, price))
+   {
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE,  InpMarkerCode);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,      col);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,      InpMarkerWidth);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR,     anchor);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+      if(DEBUG_MODE) Print("[SP1] Marker: ", (isBuy?"BUY":"SELL"),
+                           " @ ", TimeToString(barTime), " price=", price);
+   }
+   else
+      Print("[SP1 ERROR] ObjectCreate failed: ", name, " err=", GetLastError());
 }
 
 //+------------------------------------------------------------------+
-//| Extract "signal":"BUY"/"SELL"/"NONE" from a /api/signal response  |
+//| Parse /api/signal response → "BUY", "SELL", or "NONE"           |
 //+------------------------------------------------------------------+
-string ExtractSignal(const string &response)
+string ExtractSignal(const string &resp)
 {
-   if(StringFind(response, "\"signal\":\"BUY\"") >= 0)  return "BUY";
-   if(StringFind(response, "\"signal\":\"SELL\"") >= 0) return "SELL";
+   if(StringFind(resp, "\"signal\":\"BUY\"")  >= 0) return "BUY";
+   if(StringFind(resp, "\"signal\":\"SELL\"") >= 0) return "SELL";
    return "NONE";
 }
 
 //+------------------------------------------------------------------+
-//| Parse /api/calculate response and draw markers for every          |
-//| historical BUY/SELL entry. Relies on field order emitted by       |
-//| server/indicator.js: {"index":N, ..., "time":T, ..., "signal":S}  |
+//| Parse /api/calculate response                                    |
+//| Expects: {"results":[{"index":N,"signal":"BUY|SELL"},…]}         |
+//| Uses index to look up the candle in rates[] for high/low.        |
 //+------------------------------------------------------------------+
-void ProcessCalculateResponse(const string &response, const MqlRates &rates[])
+void ProcessCalculateResponse(const string &resp, const MqlRates &rates[], int count)
 {
-   int pos = 0;
+   int pos   = 0;
    int drawn = 0;
 
    while(true)
    {
-      int idxTag = StringFind(response, "\"index\":", pos);
+      // Find next "index": field
+      int idxTag = StringFind(resp, "\"index\":", pos);
       if(idxTag < 0) break;
 
       int idxStart = idxTag + 8;
-      int idxComma = StringFind(response, ",", idxStart);
+      int idxComma = StringFind(resp, ",", idxStart);
       if(idxComma < 0) break;
-      int barIndex = (int)StringToInteger(StringSubstr(response, idxStart, idxComma - idxStart));
+      int barIndex = (int)StringToInteger(StringSubstr(resp, idxStart, idxComma - idxStart));
 
-      int nextIdxTag = StringFind(response, "\"index\":", idxComma);
-      int searchEnd  = (nextIdxTag < 0) ? StringLen(response) : nextIdxTag;
+      // Find the "signal" field in the same object
+      // Search only up to the next "index": so we stay inside this object
+      int nextIdx  = StringFind(resp, "\"index\":", idxComma);
+      int searchTo = (nextIdx < 0) ? StringLen(resp) : nextIdx;
 
-      int sigTag = StringFind(response, "\"signal\":\"", idxComma);
-      if(sigTag < 0 || sigTag > searchEnd) { pos = (nextIdxTag < 0) ? StringLen(response) : nextIdxTag; continue; }
+      int sigTag = StringFind(resp, "\"signal\":\"", idxComma);
+      if(sigTag < 0 || sigTag > searchTo) { pos = (nextIdx < 0) ? StringLen(resp) : nextIdx; continue; }
 
       int sigStart = sigTag + 10;
-      int sigEnd   = StringFind(response, "\"", sigStart);
-      string signal = StringSubstr(response, sigStart, sigEnd - sigStart);
+      int sigEnd   = StringFind(resp, "\"", sigStart);
+      if(sigEnd < 0) break;
+      string sig = StringSubstr(resp, sigStart, sigEnd - sigStart);
 
-      if((signal == "BUY" || signal == "SELL") && barIndex >= 0 && barIndex < ArraySize(rates))
+      if((sig == "BUY" || sig == "SELL") && barIndex >= 0 && barIndex < count)
       {
-         DrawMarker(rates[barIndex].time, rates[barIndex].high, rates[barIndex].low, signal == "BUY");
+         DrawMarker(rates[barIndex].time, rates[barIndex].high, rates[barIndex].low, sig == "BUY");
          drawn++;
       }
 
-      pos = (nextIdxTag < 0) ? StringLen(response) : nextIdxTag;
+      pos = (nextIdx < 0) ? StringLen(resp) : nextIdx;
    }
 
-   if(DEBUG_MODE) Print("[SP1 DEBUG] Historical backfill complete. Markers drawn: ", drawn);
+   Print("[SP1] Historical backfill complete. Markers drawn: ", drawn);
 }
 
 //+------------------------------------------------------------------+
-//| One-time historical backfill via /api/calculate                   |
+//| Historical backfill — ONE request on EA attach                   |
 //+------------------------------------------------------------------+
 void RunHistoricalBackfill()
 {
-   MqlRates rates[];
-   ArraySetAsSeries(rates, false); // oldest -> newest
+   Print("[SP1] Starting historical backfill (", InpHistoryCount, " bars)...");
 
-   // shift=1 skips the currently forming bar entirely - every bar we fetch is closed
+   MqlRates rates[];
+   ArraySetAsSeries(rates, false);
+
+   // shift=1 → skip the forming bar, every candle fetched is closed
    int copied = CopyRates(_Symbol, _Period, 1, InpHistoryCount, rates);
    if(copied < InpSpreadLen)
    {
-      Print("[SP1 ERROR] Backfill: not enough history (", copied, " bars, need ", InpSpreadLen, ")");
+      Print("[SP1 ERROR] Not enough history: ", copied, " bars");
       return;
    }
 
-   string body = "{\"symbol\":\"" + _Symbol + "\"" +
-                 ",\"timeframe\":\"" + GetTimeframeString(_Period) + "\"" +
-                 ",\"settings\":" + BuildSettingsJson() +
-                 ",\"candles\":" + BuildCandlesJson(rates, copied) + "}";
+   string body = "{\"symbol\":\""    + _Symbol                    + "\","
+               + "\"timeframe\":\"" + TFString(_Period)           + "\","
+               + "\"settings\":"    + BuildSettingsJson()          + ","
+               + "\"candles\":"     + BuildCandlesJson(rates, copied) + "}";
 
-   string response;
-   int status = HttpPost(InpServerBaseUrl + "/api/calculate", body, response);
-   if(status != 200)
-   {
-      Print("[SP1 ERROR] Backfill request failed with status ", status);
-      return;
-   }
+   string resp;
+   int code = HttpPost(InpServerBaseUrl + "/api/calculate", body, resp);
+   if(code != 200) { Print("[SP1 ERROR] Backfill HTTP ", code); return; }
+   if(DEBUG_MODE) Print("[SP1 DEBUG] Backfill response (200 chars): ", StringSubstr(resp, 0, 200));
 
-   ProcessCalculateResponse(response, rates);
+   ProcessCalculateResponse(resp, rates, copied);
+   ChartRedraw(0);
    g_backfillDone = true;
 }
 
 //+------------------------------------------------------------------+
-//| Check the most recently CLOSED candle for a live signal            |
+//| Live signal check — called once per confirmed new bar            |
 //+------------------------------------------------------------------+
 void CheckLiveSignal()
 {
    MqlRates rates[];
-   ArraySetAsSeries(rates, false); // oldest -> newest
+   ArraySetAsSeries(rates, false);
 
-   // shift=1 -> we never send the still-forming bar, fixing the "always NONE" bug
+   // shift=1 → always skip the forming bar
    int copied = CopyRates(_Symbol, _Period, 1, InpCandleCount, rates);
-   if(copied < InpSpreadLen)
-   {
-      if(DEBUG_MODE) Print("[SP1 DEBUG] Not enough closed candles yet (", copied, ")");
-      return;
-   }
+   if(copied < InpSpreadLen) return;
 
    MqlRates lastClosed = rates[copied - 1];
 
-   string body = "{\"symbol\":\"" + _Symbol + "\"" +
-                 ",\"timeframe\":\"" + GetTimeframeString(_Period) + "\"" +
-                 ",\"settings\":" + BuildSettingsJson() +
-                 ",\"candles\":" + BuildCandlesJson(rates, copied) + "}";
+   string body = "{\"symbol\":\""    + _Symbol                       + "\","
+               + "\"timeframe\":\"" + TFString(_Period)              + "\","
+               + "\"settings\":"    + BuildSettingsJson()             + ","
+               + "\"candles\":"     + BuildCandlesJson(rates, copied) + "}";
 
-   string response;
-   int status = HttpPost(InpServerBaseUrl + "/api/signal", body, response);
-   if(status != 200)
+   string resp;
+   int code = HttpPost(InpServerBaseUrl + "/api/signal", body, resp);
+   if(code != 200) { Print("[SP1 ERROR] Signal HTTP ", code); return; }
+
+   string sig = ExtractSignal(resp);
+   Print("[SP1 LIVE] Bar ", TimeToString(lastClosed.time), " → ", sig);
+
+   if(sig == "BUY" || sig == "SELL")
    {
-      Print("[SP1 ERROR] Signal request failed with status ", status);
-      return;
+      DrawMarker(lastClosed.time, lastClosed.high, lastClosed.low, sig == "BUY");
+      ChartRedraw(0);
    }
 
-   string signal = ExtractSignal(response);
-   if(DEBUG_MODE) Print("[SP1 DEBUG] Live signal for closed bar ", TimeToString(lastClosed.time), " = ", signal);
-
-   if(signal == "BUY")
-      DrawMarker(lastClosed.time, lastClosed.high, lastClosed.low, true);
-   else if(signal == "SELL")
-      DrawMarker(lastClosed.time, lastClosed.high, lastClosed.low, false);
-
-   Comment("Abdullah SP1 | ", _Symbol, " ", GetTimeframeString(_Period),
-           " | Last closed bar: ", TimeToString(lastClosed.time),
-           " | Signal: ", signal);
+   Comment("Abdullah SP1 | ", _Symbol, " ", TFString(_Period),
+           " | Last bar: ", TimeToString(lastClosed.time),
+           " | Signal: ", sig);
 }
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                             |
+//| OnInit                                                           |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   g_lastSeenFormingBarTime = 0;
+   g_lastBarTime  = 0;
    g_backfillDone = false;
 
-   Print("[SP1] Abdullah SP1 EA initialized. Server: ", InpServerBaseUrl);
+   Print("=== Abdullah SP1 v3.1 | ", _Symbol, " ", TFString(_Period), " ===");
+
+   ObjectsDeleteAll(0, OBJ_PREFIX);   // clear any leftover markers
 
    if(InpBackfillOnStart)
       RunHistoricalBackfill();
 
-   return(INIT_SUCCEEDED);
+   return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization                                           |
+//| OnDeinit                                                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    Comment("");
-   Print("[SP1] Abdullah SP1 EA deinitialized. Reason: ", reason);
+   ObjectsDeleteAll(0, OBJ_PREFIX);
+   Print("[SP1] EA removed. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                              |
+//| OnTick                                                           |
+//|                                                                  |
+//| FIX 3: Use iTime(_Symbol, _Period, 1) — the time of the last     |
+//| CLOSED bar — as the guard value instead of iTime(0).             |
+//| iTime(0) can flicker to 0 or repeat at bar boundaries on         |
+//| Windows MT5, causing the guard to pass multiple times.           |
+//| iTime(1) is stable the moment the new bar opens and never        |
+//| changes until the next bar, making it a reliable one-shot guard. |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   datetime currentFormingBarTime = iTime(_Symbol, _Period, 0);
-   if(currentFormingBarTime == 0) return;
+   datetime lastClosedBarTime = iTime(_Symbol, _Period, 1);
+   if(lastClosedBarTime == 0)           return;   // data not ready yet
+   if(lastClosedBarTime == g_lastBarTime) return;  // already processed this bar
 
-   // Only act once per new bar (i.e. once the previous bar has actually closed)
-   if(currentFormingBarTime == g_lastSeenFormingBarTime) return;
-   g_lastSeenFormingBarTime = currentFormingBarTime;
-
+   g_lastBarTime = lastClosedBarTime;
    CheckLiveSignal();
 }
 //+------------------------------------------------------------------+
